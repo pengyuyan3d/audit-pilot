@@ -1,17 +1,93 @@
-/* 智审领航 · AuditPilot GitHub Pages 在线交互演示前端 */
+/* 智审领航 · AuditPilot GitHub Pages 在线交互演示前端
+ * 支持双模式：
+ * 1. 未填 Key：内置确定性审计演示引擎（零成本、断网/访客可用）
+ * 2. 右上角配置 API Key（仅存于本机浏览器 localStorage，不进公有仓库）：直连 DeepSeek / OpenAI 兼容 API 流式输出，并在本地完成脱敏还原与主备降级
+ */
+
 const BUNDLE = window.AUDIT_PILOT_STATIC_BUNDLE;
+const CFG_STORAGE_KEY = "audit_pilot_pages_llm_cfg_v1";
+
+const DEFAULT_CFG = {
+  primary_base_url: "https://api.deepseek.com/v1",
+  primary_model: "deepseek-chat",
+  primary_api_key: "",
+  backup_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  backup_model: "qwen-plus",
+  backup_api_key: "",
+};
+
+const SYSTEM_PROMPT = `你是「智审领航 · AuditPilot」企业级智能审计助手，服务于头部会计师事务所（RSM/容诚标准）。
+请严格遵守：
+1. 所有金额、笔数与异常必须严格依据提供的确定性查账与账同核对结果，严禁编造数字。
+2. 引用合同条款时保留 [证据:DOC-XXXX-C0X] 格式与页码条款号。
+3. 保留文中的实体占位符（如 [ENTITY_1]、[BANK_ACCT_1]）原样输出，本地网关会自动还原。`;
+
+function loadCfg() {
+  try {
+    return { ...DEFAULT_CFG, ...JSON.parse(localStorage.getItem(CFG_STORAGE_KEY) || "{}") };
+  } catch {
+    return { ...DEFAULT_CFG };
+  }
+}
+
+function saveCfg(cfg) {
+  localStorage.setItem(CFG_STORAGE_KEY, JSON.stringify(cfg));
+}
+
 const state = {
   docs: BUNDLE.documents || [],
   activeEvidenceMap: {},
   traces: [],
   streaming: false,
   simulateFailover: false,
+  cfg: loadCfg(),
 };
 
 const $ = (id) => document.getElementById(id);
 
 function escapeHtml(str) {
   return String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function maskKeyPreview(k) {
+  k = (k || "").trim();
+  if (!k) return "";
+  return k.length <= 8 ? "****" : `${k.slice(0, 4)}****${k.slice(-4)}`;
+}
+
+function createUnmasker(mappings) {
+  const map = {};
+  (mappings || []).forEach((m) => { map[m.placeholder] = m.original; });
+  const unmaskStr = (s) => s.replace(/\[(?:BANK_ACCT|TAX_ID|PHONE|ENTITY)_\d+\]/g, (tok) => map[tok] || tok);
+  let buf = "";
+  return {
+    feed(chunk) {
+      if (!chunk) return "";
+      buf += chunk;
+      let out = "";
+      while (buf.length) {
+        const idx = buf.indexOf("[");
+        if (idx === -1) { out += buf; buf = ""; break; }
+        if (idx > 0) { out += buf.slice(0, idx); buf = buf.slice(idx); }
+        const closeIdx = buf.indexOf("]");
+        if (closeIdx !== -1) {
+          out += unmaskStr(buf.slice(0, closeIdx + 1));
+          buf = buf.slice(closeIdx + 1);
+        } else if (buf.length > 24) {
+          out += buf[0];
+          buf = buf.slice(1);
+        } else {
+          break;
+        }
+      }
+      return out;
+    },
+    flush() {
+      const rest = unmaskStr(buf);
+      buf = "";
+      return rest;
+    },
+  };
 }
 
 function renderMarkdown(md) {
@@ -58,6 +134,17 @@ function renderMarkdown(md) {
   }
   flushList(); flushTable();
   return html;
+}
+
+function updateModeBadge() {
+  const hasPrimary = Boolean(state.cfg.primary_api_key?.trim());
+  const hasBackup = Boolean(state.cfg.backup_api_key?.trim());
+  if (hasPrimary || hasBackup) {
+    const model = hasPrimary ? state.cfg.primary_model : state.cfg.backup_model;
+    $("modeBadge").textContent = `模式: 浏览器直连实时模型 (${model})`;
+  } else {
+    $("modeBadge").textContent = "模式: 在线演示版 (点右侧可配 Key)";
+  }
 }
 
 function switchTab(tabName) {
@@ -118,6 +205,51 @@ function matchScenario(query) {
   return BUNDLE.scenarios[keys[0]];
 }
 
+async function streamOpenAICompat(baseUrl, apiKey, model, maskedPrompt, onToken) {
+  const endpoint = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      stream: true,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: maskedPrompt },
+      ],
+    }),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => resp.statusText);
+    throw new Error(`HTTP ${resp.status}: ${errText.slice(0, 120)}`);
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() || "";
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) continue;
+      const dataStr = line.slice(5).trim();
+      if (dataStr === "[DONE]") return;
+      try {
+        const obj = JSON.parse(dataStr);
+        const delta = obj.choices?.[0]?.delta?.content;
+        if (delta) onToken(delta);
+      } catch { /* ignore heartbeat */ }
+    }
+  }
+}
+
 async function sendQuery(queryText) {
   const query = (queryText || "").trim();
   if (!query || state.streaming) return;
@@ -147,35 +279,90 @@ async function sendQuery(queryText) {
   const stepsList = botEl.querySelector(".steps-list");
   const mdBody = botEl.querySelector(".md-body");
   const botFooter = botEl.querySelector(".bot-footer");
-
-  const allSteps = [...(sc.steps_log || []), {
-    node: "masking_gateway",
-    message: `网关脱敏完成：保护 ${sc.masking.total_masked_entities} 个敏感实体，外发泄露校验=0`
-  }];
-  if (state.simulateFailover) {
-    allSteps.push({ node: "failover", message: "故障演练已开启：模拟主模型超时，自动降级至备用/本地确定性审计引擎" });
-  }
-  for (const st of allSteps) {
+  const pushStep = (node, message) => {
     const item = document.createElement("div");
     item.className = "step-item";
-    item.textContent = `[${st.node}] ${st.message}`;
+    item.textContent = `[${node}] ${message}`;
     stepsList.appendChild(item);
-    await new Promise((r) => setTimeout(r, 90));
+  };
+
+  for (const st of sc.steps_log || []) {
+    pushStep(st.node, st.message);
+    await new Promise((r) => setTimeout(r, 70));
   }
+  pushStep("masking_gateway", `网关脱敏完成：保护 ${sc.masking.total_masked_entities} 个敏感实体，外发泄露校验=0`);
 
   (sc.evidence || []).forEach((ev) => { state.activeEvidenceMap[ev.chunk_id] = ev; });
   renderMaskingInspector(sc);
 
-  const fullText = sc.answer_md;
-  let acc = "";
-  for (let i = 0; i < fullText.length; i += 24) {
-    acc += fullText.slice(i, i + 24);
-    mdBody.innerHTML = renderMarkdown(acc);
-    feed.scrollTop = feed.scrollHeight;
-    await new Promise((r) => setTimeout(r, 12));
+  const t0 = performance.now();
+  let ttftMs = null;
+  let fullText = "";
+  let modelUsed = "pages-demo:deterministic-engine";
+  let failoverTriggered = false;
+  const unmasker = createUnmasker(sc.masking?.mappings || []);
+  const maskedPrompt = `【用户提问】\n${query}\n\n${sc.masked_prompt_preview || ""}`;
+
+  const appendUnmasked = (rawDelta) => {
+    if (ttftMs === null) ttftMs = Math.round(performance.now() - t0);
+    const clean = unmasker.feed(rawDelta);
+    if (clean) {
+      fullText += clean;
+      mdBody.innerHTML = renderMarkdown(fullText);
+      feed.scrollTop = feed.scrollHeight;
+    }
+  };
+
+  let streamedLive = false;
+  const hasPrimary = Boolean(state.cfg.primary_api_key?.trim());
+  const hasBackup = Boolean(state.cfg.backup_api_key?.trim());
+
+  if (hasPrimary) {
+    try {
+      if (state.simulateFailover) throw new Error("故障演练已开启：模拟主模型连接超时");
+      modelUsed = `primary:${state.cfg.primary_model}`;
+      await streamOpenAICompat(state.cfg.primary_base_url, state.cfg.primary_api_key.trim(), state.cfg.primary_model, maskedPrompt, appendUnmasked);
+      streamedLive = true;
+    } catch (err) {
+      failoverTriggered = true;
+      pushStep("failover", `主模型异常（${err.message}），正在自动降级...`);
+    }
   }
 
-  const modelUsed = state.simulateFailover ? "backup:offline-demo-engine" : "pages-demo:audit-engine";
+  if (!streamedLive && hasBackup) {
+    try {
+      modelUsed = `backup:${state.cfg.backup_model}`;
+      await streamOpenAICompat(state.cfg.backup_base_url, state.cfg.backup_api_key.trim(), state.cfg.backup_model, maskedPrompt, appendUnmasked);
+      streamedLive = true;
+    } catch (err) {
+      failoverTriggered = true;
+      pushStep("failover", `备用模型异常（${err.message}），回落至本地确定性审计引擎`);
+    }
+  }
+
+  if (streamedLive) {
+    const tail = unmasker.flush();
+    if (tail) {
+      fullText += tail;
+      mdBody.innerHTML = renderMarkdown(fullText);
+    }
+  } else {
+    if (state.simulateFailover && !failoverTriggered) {
+      failoverTriggered = true;
+      pushStep("failover", "故障演练已开启：模拟主模型超时，自动降级至本地确定性审计引擎");
+    }
+    modelUsed = failoverTriggered ? "backup:offline-demo-engine" : "pages-demo:deterministic-engine";
+    const demoText = sc.answer_md;
+    for (let i = 0; i < demoText.length; i += 24) {
+      if (ttftMs === null) ttftMs = Math.round(performance.now() - t0);
+      fullText += demoText.slice(i, i + 24);
+      mdBody.innerHTML = renderMarkdown(fullText);
+      feed.scrollTop = feed.scrollHeight;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  const totalMs = Math.round(performance.now() - t0);
   const traceRec = { trace_id: traceId, query, intent: sc.intent, review: "pending", answer: fullText };
   state.traces.unshift(traceRec);
   renderTraceHistory();
@@ -184,17 +371,17 @@ async function sendQuery(queryText) {
     <div class="pane-tip">
       <strong>Trace ID：</strong><code>${traceId}</code><br/>
       <strong>编排路径：</strong><code>${(sc.route_path || []).join(" → ")}</code><br/>
-      <strong>模型 / 延迟：</strong><code>${modelUsed}</code> · TTFT 18ms · 总耗时 142ms
+      <strong>模型 / 延迟：</strong><code>${modelUsed}</code> · TTFT ${ttftMs ?? totalMs}ms · 总耗时 ${totalMs}ms
     </div>
     ${sc.sql_executed?.length ? `<h4 class="sub-heading">本次执行的确定性 SQL</h4><div class="code-box">${escapeHtml(sc.sql_executed.join("\n\n"))}</div>` : ""}`;
 
   botFooter.classList.remove("hidden");
   botFooter.innerHTML = `
     <div class="perf-capsule">
-      <span>模型: ${modelUsed}</span>
-      <span>TTFT: 18ms</span>
-      <span>总耗时: 142ms</span>
-      ${state.simulateFailover ? '<span class="tag-failover">🔄 已触发主备降级</span>' : ""}
+      <span>模型: ${escapeHtml(modelUsed)}</span>
+      <span>TTFT: ${ttftMs ?? totalMs}ms</span>
+      <span>总耗时: ${totalMs}ms</span>
+      ${failoverTriggered ? '<span class="tag-failover">🔄 已触发主备降级</span>' : ""}
     </div>
     <div class="review-bar">
       <button class="btn-sm btn-confirm">✅ CPA确认异常</button>
@@ -237,7 +424,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("statAmount").textContent = `¥${Number(l.total_amount).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}`;
   $("statPayees").textContent = `${l.payee_count} 家`;
   $("statPeriod").textContent = `${l.min_date.slice(5)} ~ ${l.max_date.slice(5)}`;
-  $("modeBadge").textContent = "模式: GitHub Pages 在线演示版";
+  updateModeBadge();
 
   $("docList").innerHTML = state.docs.map((d) => `
     <div class="doc-item" data-doc-id="${d.doc_id}">
@@ -256,9 +443,45 @@ document.addEventListener("DOMContentLoaded", () => {
     const val = $("chatInput").value; $("chatInput").value = "";
     sendQuery(val);
   });
+  $("chatInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); }
+  });
   $("failoverCheckbox").addEventListener("change", (e) => { state.simulateFailover = e.target.checked; });
 
-  $("btnSettings").addEventListener("click", () => alert("当前为 GitHub Pages 静态在线演示版。如需连接真实 DeepSeek / 通义千问 API，请在本地运行 uvicorn backend.main:app 后在右上角配置。"));
+  // 模型 Key 本地安全配置弹窗（存浏览器 localStorage，不上传公有仓库）
+  $("btnSettings").addEventListener("click", () => {
+    $("cfgPrimaryUrl").value = state.cfg.primary_base_url;
+    $("cfgPrimaryModel").value = state.cfg.primary_model;
+    $("cfgPrimaryKey").value = "";
+    $("cfgPrimaryKey").placeholder = state.cfg.primary_api_key
+      ? `已在本机保存 (${maskKeyPreview(state.cfg.primary_api_key)})，留空保持不变`
+      : "粘贴 DeepSeek / OpenAI 兼容 API Key（仅存本机浏览器）";
+    $("cfgBackupUrl").value = state.cfg.backup_base_url;
+    $("cfgBackupModel").value = state.cfg.backup_model;
+    $("cfgBackupKey").value = "";
+    $("cfgBackupKey").placeholder = state.cfg.backup_api_key
+      ? `已在本机保存 (${maskKeyPreview(state.cfg.backup_api_key)})，留空保持不变`
+      : "可选：粘贴备用降级模型 API Key";
+    $("settingsModal").classList.remove("hidden");
+  });
+  $("closeSettings").addEventListener("click", () => $("settingsModal").classList.add("hidden"));
+  $("cancelSettings").addEventListener("click", () => $("settingsModal").classList.add("hidden"));
+  $("saveSettings").addEventListener("click", () => {
+    const next = {
+      ...state.cfg,
+      primary_base_url: $("cfgPrimaryUrl").value.trim() || DEFAULT_CFG.primary_base_url,
+      primary_model: $("cfgPrimaryModel").value.trim() || DEFAULT_CFG.primary_model,
+      backup_base_url: $("cfgBackupUrl").value.trim() || DEFAULT_CFG.backup_base_url,
+      backup_model: $("cfgBackupModel").value.trim() || DEFAULT_CFG.backup_model,
+    };
+    if ($("cfgPrimaryKey").value.trim()) next.primary_api_key = $("cfgPrimaryKey").value.trim();
+    if ($("cfgBackupKey").value.trim()) next.backup_api_key = $("cfgBackupKey").value.trim();
+    state.cfg = next;
+    saveCfg(next);
+    updateModeBadge();
+    $("settingsModal").classList.add("hidden");
+  });
+
   $("btnExportFlywheel").addEventListener("click", () => {
     const reviewed = state.traces.filter((t) => t.review !== "pending");
     const lines = (reviewed.length ? reviewed : [{ trace_id: "DEMO-01", query: "全面综合审计", answer: Object.values(BUNDLE.scenarios)[0].answer_md, review: "confirmed" }])
