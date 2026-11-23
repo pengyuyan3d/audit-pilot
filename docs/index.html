@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智审领航 · AuditPilot — 企业级智能审计与风险核查工作台</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">AP</div>
+      <div>
+        <div class="brand-title">智审领航 · AuditPilot <span class="badge badge-teal">RSM 审计数智化演示版</span></div>
+        <div class="brand-sub">确定性算账 · 混合 RAG 溯源 · 网关归一化脱敏 · LangGraph 编排 · 数据飞轮</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="badge badge-green" id="shieldBadge">🛡 脱敏网关 ON · 零泄露</span>
+      <span class="badge badge-navy" id="modeBadge">模式: 检测中...</span>
+      <label class="failover-toggle" title="开启后模拟主模型超时，演示自动降级至备用模型/本地兜底引擎">
+        <input type="checkbox" id="failoverCheckbox" />
+        <span>主模型故障演练</span>
+      </label>
+      <button class="btn btn-outline" id="btnSettings">⚙ 模型/Key 配置</button>
+      <button class="btn btn-outline" id="btnEval">📊 一键评测</button>
+      <button class="btn btn-primary" id="btnExportFlywheel">⬇ 导出 SFT 飞轮</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- 左栏：审计资料与一键演示 -->
+    <aside class="panel panel-left">
+      <section class="card">
+        <div class="card-header">
+          <h3>📁 财务明细流水</h3>
+          <label class="btn-link upload-label">
+            上传 Excel/CSV
+            <input type="file" id="ledgerFileInput" accept=".xlsx,.csv" hidden />
+          </label>
+        </div>
+        <div class="stats-grid" id="ledgerStats">
+          <div class="stat-item"><span class="stat-label">流水笔数</span><strong id="statRows">-</strong></div>
+          <div class="stat-item"><span class="stat-label">累计金额</span><strong id="statAmount">-</strong></div>
+          <div class="stat-item"><span class="stat-label">收款主体</span><strong id="statPayees">-</strong></div>
+          <div class="stat-item"><span class="stat-label">账期范围</span><strong id="statPeriod">-</strong></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h3>📄 合同资料库（条款级索引）</h3>
+          <label class="btn-link upload-label">
+            上传合同
+            <input type="file" id="contractFileInput" accept=".md,.txt,.pdf" hidden />
+          </label>
+        </div>
+        <div class="doc-list" id="docList">加载中...</div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h3>⚡ 面试一键演示场景</h3>
+        </div>
+        <div class="preset-list">
+          <button class="preset-btn" data-query="请对当前财务流水与全部采购合同执行全面综合审计，汇总所有账同交叉异常、流水异常和高风险合同条款。">
+            <strong>1. 全量一键综合审计</strong>
+            <span>流水 L1 算子 + 账同交叉 + 合同混合 RAG</span>
+          </button>
+          <button class="preset-btn" data-query="请执行账同交叉核对：检查是否存在超合同总额付款，以及向非合同约定收款账户打款的异常。">
+            <strong>2. 账同交叉核对（超付/异常账户）</strong>
+            <span>验证银行账号归一化零误报 + 超付 38 万</span>
+          </button>
+          <button class="preset-btn" data-query="请筛查财务明细流水中的拆分付款规避20万审批阈值、重复付款以及周末/节假日非工作时段付款。">
+            <strong>3. 财务流水异常筛查（L1 算子）</strong>
+            <span>拆分 54.5 万 / 重复 8.65 万 / 深夜节假日</span>
+          </button>
+          <button class="preset-btn" data-query="请审查采购合同中关于违约金、单方面涨价、质保期以及知识产权归属的高风险条款，并给出原文页码溯源。">
+            <strong>4. 合同高风险条款审查（混合 RAG）</strong>
+            <span>BM25 + Dense RRF 召回 + 精排点击高亮</span>
+          </button>
+          <button class="preset-btn" data-query="SELECT payee_name, COUNT(*) AS tx_count, ROUND(SUM(amount), 2) AS total_amount FROM ledger_transactions GROUP BY payee_name ORDER BY total_amount DESC LIMIT 5">
+            <strong>5. L2 只读 SQL 沙箱查数</strong>
+            <span>SQLite Authorizer 防注入，直出 Top 5 收款方</span>
+          </button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- 中栏：智能审计流式对话工作区 -->
+    <section class="panel panel-center">
+      <div class="chat-feed" id="chatFeed">
+        <div class="welcome-box">
+          <h2>欢迎使用 AuditPilot V2 智能审计工作台</h2>
+          <p>点击左侧任意<strong>「一键演示场景」</strong>或在下方输入审计问题（也支持直接输入 <code>SELECT ...</code> 验证 L2 只读 SQL 沙箱）。</p>
+          <div class="arch-pills">
+            <span>ADR-1 网关归一化脱敏</span>
+            <span>ADR-2 L1算子 + L2只读沙箱</span>
+            <span>ADR-3 RRF召回 + 0~1精排</span>
+            <span>ADR-4 CPA复核数据飞轮</span>
+          </div>
+        </div>
+      </div>
+
+      <form class="chat-input-bar" id="chatForm">
+        <textarea id="chatInput" rows="2" placeholder="输入审计提问，例如：核查华兴供应链是否存在超合同总额付款...（Enter 发送，Shift+Enter 换行）"></textarea>
+        <div class="input-actions">
+          <label class="mini-check" title="勾选后跳过本地 TTL 缓存，强制重新执行">
+            <input type="checkbox" id="bypassCacheCheck" />
+            <span>跳过缓存</span>
+          </label>
+          <button type="submit" class="btn btn-primary" id="btnSend">开始审计 ▶</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 右栏：三标签检视面板（原文溯源 / 脱敏透视 / 审计追踪） -->
+    <aside class="panel panel-right">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="source">🔍 原文溯源</button>
+        <button class="tab-btn" data-tab="masking">🛡 脱敏透视</button>
+        <button class="tab-btn" data-tab="trace">🧾 审计追踪</button>
+      </div>
+
+      <div class="tab-pane active" id="tab-source">
+        <div class="pane-tip" id="sourceHeader">点击回答中的 <code>[证据:DOC-...]</code> 标签或左侧合同，在此处高亮定位原文条款。</div>
+        <div class="clause-viewer" id="clauseViewer"></div>
+      </div>
+
+      <div class="tab-pane" id="tab-masking">
+        <div class="masking-summary" id="maskingSummary">执行一次审计查询后，可在此实时检视发往 LLM 前的实体脱敏映射与零泄露校验结果。</div>
+        <div id="maskingTableWrap"></div>
+        <div class="prompt-compare" id="promptCompare"></div>
+      </div>
+
+      <div class="tab-pane" id="tab-trace">
+        <div class="trace-current" id="traceCurrent">暂无本次审计追踪记录。</div>
+        <h4 class="sub-heading">历史审计追踪（SQLite 持久化）</h4>
+        <div class="trace-history" id="traceHistory"></div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- 模型配置弹窗 -->
+  <div class="modal-backdrop hidden" id="settingsModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>⚙ 主/备大模型 API 热配置（无需重启服务）</h3>
+        <button class="btn-close" id="closeSettings">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">留空 API Key 时自动运行在<strong>内置离线演示模式</strong>（本地 SQL/RAG/脱敏全部真实执行）。填入任意 OpenAI 兼容 Key 后即刻切换真实大模型流式输出。</p>
+        <div class="form-group">
+          <label>主模型 Base URL（如 DeepSeek）</label>
+          <input type="text" id="cfgPrimaryUrl" />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>主模型名称</label>
+            <input type="text" id="cfgPrimaryModel" />
+          </div>
+          <div class="form-group">
+            <label>主模型 API Key</label>
+            <input type="password" id="cfgPrimaryKey" placeholder="留空保持不变" />
+          </div>
+        </div>
+        <hr class="divider" />
+        <div class="form-group">
+          <label>备用降级模型 Base URL（如通义千问 / 豆包）</label>
+          <input type="text" id="cfgBackupUrl" />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>备用模型名称</label>
+            <input type="text" id="cfgBackupModel" />
+          </div>
+          <div class="form-group">
+            <label>备用模型 API Key</label>
+            <input type="password" id="cfgBackupKey" placeholder="留空保持不变" />
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="cancelSettings">取消</button>
+        <button class="btn btn-primary" id="saveSettings">保存并立即生效</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 自动化评测结果弹窗 -->
+  <div class="modal-backdrop hidden" id="evalModal">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3>📊 12 条黄金审计用例自动化评测报告</h3>
+        <button class="btn-close" id="closeEval">✕</button>
+      </div>
+      <div class="modal-body" id="evalBody">正在运行自动化评测...</div>
+    </div>
+  </div>
+
+  <script src="./demo_bundle.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

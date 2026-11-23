@@ -1,0 +1,41 @@
+{
+  "total_rows": 72,
+  "planted_anomalies": {
+    "overpayment": {
+      "contract_no": "CT-2026-001",
+      "payee": "华兴供应链管理有限公司",
+      "contract_limit": 1200000.0,
+      "actual_paid": 1580000.0,
+      "excess": 380000.0
+    },
+    "unauthorized_account": {
+      "contract_no": "CT-2026-002",
+      "voucher_no": "PZ-20260528-907",
+      "expected_account": "6228480088776655432",
+      "actual_account": "6225880199998888777",
+      "amount": 220000.0
+    },
+    "split_payment": {
+      "payee": "盛达物流有限公司",
+      "date": "2026-03-18",
+      "count": 3,
+      "total_amount": 545000.0
+    },
+    "duplicate_payment": {
+      "payee": "恒信模具加工厂",
+      "vouchers": [
+        "PZ-20260512-911",
+        "PZ-20260513-912"
+      ],
+      "amount": 86500.0
+    },
+    "off_hours_payment": {
+      "payee": "远景咨询服务有限公司",
+      "vouchers": [
+        "PZ-20260501-913",
+        "PZ-20260614-914"
+      ],
+      "total_amount": 363000.0
+    }
+  }
+}
